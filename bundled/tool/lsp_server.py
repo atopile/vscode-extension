@@ -11,7 +11,74 @@ import re
 import sys
 import sysconfig
 import traceback
+from pathlib import Path
 from typing import Any, Optional, Sequence
+
+from atopile import front_end, address, config, errors, parse
+import atopile.parse_utils
+import atopile.datatypes
+
+# **********************************************************
+# Utils for interacting with the atopile front-end
+# **********************************************************
+
+_line_to_def_block: dict[Path, dict[int, address.AddrStr]] = {}
+
+
+def _reset_caches(file: Path):
+    """Remove a file from the cache."""
+    if file in parse.parser.cache:
+        del parse.parser.cache[file]
+
+    if file in _line_to_def_block:
+        del _line_to_def_block[file]
+
+    # TODO: only clear these caches of what's been invalidated
+    file_str = str(file)
+    to_clear = [addr for addr in front_end.scoop._output_cache if addr.startswith(file_str)]
+    for addr in to_clear:
+        del front_end.scoop._output_cache[addr]
+
+    to_clear = [addr for addr in front_end.dizzy._output_cache if addr.startswith(file_str)]
+    for addr in to_clear:
+        del front_end.dizzy._output_cache[addr]
+
+    front_end.lofty._output_cache.clear()
+
+
+def _index_class_defs_by_line(file: Path):
+    """Index class definitions in a given file by the line number"""
+    _line_to_def_block[file] = {}
+    addrs = front_end.scoop.ingest_file(file)
+
+    for addr in addrs:
+        if addr == str(file):
+            continue
+        try:
+            front_end.lofty.get_instance(addr)
+        except errors.AtoError as ex:
+            log_warning(str(ex))
+            continue
+
+        # FIXME: we shouldn't be entangling this
+        # code w/ the front-end so much
+        try:
+            cls_def = front_end.scoop.get_obj_def(addr)
+            _, start_line, _, stop_line, _ = atopile.parse_utils.get_src_info_from_ctx(
+                cls_def.src_ctx.block()
+            )
+        except AttributeError:
+            continue
+
+        for i in range(start_line + 1, stop_line + 1):
+            _line_to_def_block[file][i] = cls_def.address
+
+
+def _get_def_addr_from_line(file: Path, line: int) -> Optional[address.AddrStr]:
+    """Get the class definition from a line number"""
+    if file not in _line_to_def_block or not _line_to_def_block[file]:
+        _index_class_defs_by_line(file)
+    return _line_to_def_block[file].get(line, None)
 
 
 # **********************************************************
@@ -66,15 +133,12 @@ LSP_SERVER = server.LanguageServer(
 #  Black: https://github.com/microsoft/vscode-black-formatter/blob/main/bundled/tool
 #  isort: https://github.com/microsoft/vscode-isort/blob/main/bundled/tool
 
-# TODO: Update TOOL_MODULE with the module name for your tool.
 # e.g, TOOL_MODULE = "pylint"
 TOOL_MODULE = "atopile"
 
-# TODO: Update TOOL_DISPLAY with a display name for your tool.
 # e.g, TOOL_DISPLAY = "Pylint"
 TOOL_DISPLAY = "atopile compiler"
 
-# TODO: Update TOOL_ARGS with default argument you have to pass to your tool in
 # all scenarios.
 TOOL_ARGS = []  # default arguments always passed to your tool.
 
@@ -88,116 +152,163 @@ TOOL_ARGS = []  # default arguments always passed to your tool.
 #  See `pylint` implementation for a full featured linter extension:
 #  Pylint: https://github.com/microsoft/vscode-pylint/blob/main/bundled/tool
 
-@LSP_SERVER.feature(lsp.TEXT_DOCUMENT_COMPLETION, lsp.CompletionOptions(trigger_characters=["."], all_commit_characters=[":"]),)
+
+@LSP_SERVER.feature(lsp.TEXT_DOCUMENT_COMPLETION, lsp.CompletionOptions(trigger_characters=["."]),)
 def completions(params: Optional[lsp.CompletionParams] = None) -> lsp.CompletionList:
     """Handler for completion requests."""
-    document = LSP_SERVER.workspace.get_text_document(params.text_document.uri)
-    utils.cursor_word(document, params.position)
-    log_always(utils.cursor_word(document, params.position))
-    # match currently typed word from cursor_word return
-    # fill items with completions and return
-    # items = []
-    items = [
-            lsp.CompletionItem(label="item 1", kind=lsp.CompletionItemKind.Interface),
-            lsp.CompletionItem(label="item 2"),
-        ]
-    return lsp.CompletionList(is_incomplete=False, items=items)
+    if not params.text_document.uri.startswith("file://"):
+        return lsp.CompletionList(is_incomplete=False, items=[])
 
-@LSP_SERVER.feature(lsp.TEXT_DOCUMENT_DID_CHANGE)
-def did_open(params: lsp.DidChangeTextDocumentParams) -> None:
-    """LSP handler for textDocument/didOpen request."""
     document = LSP_SERVER.workspace.get_text_document(params.text_document.uri)
 
-    # naive method to real-time lint on every keypress
-    _linting_helper(document)
+    file = Path(document.path)
+    try:
+        config.get_project_context()
+    except ValueError:
+        config.set_project_context(config.ProjectContext.from_path(file))
+
+    word = utils.cursor_word(document, params.position)
+    class_addr = _get_def_addr_from_line(file, params.position.line) or str(file)
+    items: list[lsp.CompletionItem] = []
+
+    instance_addr = address.add_instances(class_addr, word.split(".")[:-1])
+    try:
+        instance = front_end.lofty.get_instance(instance_addr)
+    except (KeyError, errors.AtoError):
+        pass
+    else:
+        for child, assignment in instance.assignments.items():
+            items.append(lsp.CompletionItem(label=child, kind=lsp.CompletionItemKind.Property, detail=assignment[0].given_type))
+
+        for child in instance.children:
+            items.append(lsp.CompletionItem(label=child, kind=lsp.CompletionItemKind.Method))
+
+    # ++ Class Defs
+    try:
+        class_ctx = front_end.scoop.get_obj_def(class_addr)
+    except (KeyError, errors.AtoError):
+        pass
+    else:
+        closure_contexts = [class_ctx]
+        if class_ctx.closure:
+            closure_contexts.extend(class_ctx.closure)
+
+        for closure_ctx in closure_contexts:
+
+            for cls_ref in closure_ctx.local_defs:
+                items.append(lsp.CompletionItem(label=cls_ref[0], kind=lsp.CompletionItemKind.Class))
+
+            for imp_ref in closure_ctx.imports:
+                items.append(lsp.CompletionItem(label=imp_ref[0], kind=lsp.CompletionItemKind.Class))
+
+    return lsp.CompletionList(is_incomplete=False, items=items,)
+
+
+@LSP_SERVER.feature(lsp.TEXT_DOCUMENT_DEFINITION)
+def goto_definition(params: Optional[lsp.DefinitionParams] = None) -> Optional[lsp.Location]:
+    """Handler for goto definition."""
+    if not params.text_document.uri.startswith("file://"):
+        return lsp.CompletionList(is_incomplete=False, items=[])
+
+    document = LSP_SERVER.workspace.get_text_document(params.text_document.uri)
+
+    file = Path(document.path)
+    try:
+        config.get_project_context()
+    except ValueError:
+        config.set_project_context(config.ProjectContext.from_path(file))
+
+    class_addr = _get_def_addr_from_line(file, params.position.line)
+    if not class_addr:
+        class_addr = str(file)
+
+    word, range_ = utils.cursor_word_and_range(document, params.position)
+    try:
+        word = word[:word.index(".", params.position.character - range_.start.character)]
+    except ValueError:
+        pass
+
+    # See if it's an instance
+    instance_addr = address.add_instances(class_addr, word.split("."))
+    try:
+        src_ctx = front_end.lofty.get_instance(instance_addr).src_ctx
+    except (KeyError, errors.AtoError, AttributeError):
+        # See if it's a Class instead
+        pass
+
+    # See if it's a class
+    try:
+        src_ctx = front_end.scoop.get_obj_def(
+            front_end.lookup_class_in_closure(
+                front_end.scoop.get_obj_def(class_addr),
+                atopile.datatypes.Ref(word.split("."))
+            )
+        ).src_ctx
+    except (KeyError, errors.AtoError, AttributeError):
+        return
+
+    try:
+        file_path, start_line, start_col, stop_line, stop_col = atopile.parse_utils.get_src_info_from_ctx(src_ctx)
+    except AttributeError:
+        return
+    else:
+        return lsp.Location(
+            "file://" + str(file_path),
+            lsp.Range(
+                lsp.Position(start_line - 1, start_col),
+                lsp.Position(stop_line - 1, stop_col)
+            )
+        )
+
+
+# TODO: we don't currently have good enough cache management to support dynamic parsing
+# @LSP_SERVER.feature(lsp.TEXT_DOCUMENT_DID_CHANGE)
+# def did_change(params: lsp.DidChangeTextDocumentParams) -> None:
+#     """LSP handler for textDocument/didOpen request."""
+#     document = LSP_SERVER.workspace.get_text_document(params.text_document.uri)
+
+#     # naive method to real-time lint on every keypress
+#     _linting_helper(document)
+
 
 @LSP_SERVER.feature(lsp.TEXT_DOCUMENT_DID_OPEN)
 def did_open(params: lsp.DidOpenTextDocumentParams) -> None:
     """LSP handler for textDocument/didOpen request."""
+    if not params.text_document.uri.startswith("file://"):
+        return lsp.CompletionList(is_incomplete=False, items=[])
+
     document = LSP_SERVER.workspace.get_text_document(params.text_document.uri)
 
-    # lint on file open
-    diagnostics: list[lsp.Diagnostic] = _linting_helper(document)
-    LSP_SERVER.publish_diagnostics(document.uri, diagnostics)
-    log_always("did open")
+    file = Path(document.path)
+    try:
+        config.get_project_context()
+    except ValueError:
+        config.set_project_context(config.ProjectContext.from_path(file))
 
+    _index_class_defs_by_line(file)
+
+
+# TODO: remove me if we don't have a purpose for it
+# @LSP_SERVER.feature(lsp.TEXT_DOCUMENT_DID_CLOSE)
+# def did_close(params: lsp.DidCloseTextDocumentParams) -> None:
+#     """LSP handler for textDocument/didClose request."""
+#     #document = LSP_SERVER.workspace.get_text_document(params.text_document.uri)
+#     # Publishing empty diagnostics to clear the entries for this file.
+#     #LSP_SERVER.publish_diagnostics(document.uri, [])
+#     log_to_output("did close")
 
 @LSP_SERVER.feature(lsp.TEXT_DOCUMENT_DID_SAVE)
 def did_save(params: lsp.DidSaveTextDocumentParams) -> None:
     """LSP handler for textDocument/didSave request."""
-    #document = LSP_SERVER.workspace.get_text_document(params.text_document.uri)
-    #diagnostics: list[lsp.Diagnostic] = _linting_helper(document)
-    #LSP_SERVER.publish_diagnostics(document.uri, diagnostics)
-    log_to_output("did save")
+    if not params.text_document.uri.startswith("file://"):
+        return lsp.CompletionList(is_incomplete=False, items=[])
 
-@LSP_SERVER.feature(lsp.TEXT_DOCUMENT_DID_CLOSE)
-def did_close(params: lsp.DidCloseTextDocumentParams) -> None:
-    """LSP handler for textDocument/didClose request."""
-    #document = LSP_SERVER.workspace.get_text_document(params.text_document.uri)
-    # Publishing empty diagnostics to clear the entries for this file.
-    #LSP_SERVER.publish_diagnostics(document.uri, [])
-    log_to_output("did close")
+    document = LSP_SERVER.workspace.get_text_document(params.text_document.uri)
 
+    file = Path(document.path)
 
-def _linting_helper(document: workspace.Document) -> list[lsp.Diagnostic]:
-    # TODO: Determine if your tool supports passing file content via stdin.
-    # If you want to support linting on change then your tool will need to
-    # support linting over stdin to be effective. Read, and update
-    # _run_tool_on_document and _run_tool functions as needed for your project.
-    
-    # result = _run_tool_on_document(document)
-    # return _parse_output_using_regex(result.stdout) if result.stdout else []
-
-    # this is the flake8 output specified below mocked for testing
-    result = "3,21,F,F401:'mismatched input ' ' expecting {'from', ':'}'"
-    return _parse_output_using_regex(result) if result else []
-
-
-# TODO: If your linter outputs in a known format like JSON, then parse
-# accordingly. But incase you need to parse the output using RegEx here
-# is a helper you can work with.
-# flake8 example:
-# If you use following format argument with flake8 you can use the regex below to parse it.
-# TOOL_ARGS += ["--format='%(row)d,%(col)d,%(code).1s,%(code)s:%(text)s'"]
-# DIAGNOSTIC_RE =
-#    r"(?P<line>\d+),(?P<column>-?\d+),(?P<type>\w+),(?P<code>\w+\d+):(?P<message>[^\r\n]*)"
-DIAGNOSTIC_RE = re.compile(r"(?P<line>\d+),(?P<column>-?\d+),(?P<type>\w+),(?P<code>\w+\d+):(?P<message>[^\r\n]*)")
-
-
-def _parse_output_using_regex(content: str) -> list[lsp.Diagnostic]:
-    lines: list[str] = content.splitlines()
-    diagnostics: list[lsp.Diagnostic] = []
-
-    # TODO: Determine if your linter reports line numbers starting at 1 (True) or 0 (False).
-    line_at_1 = True
-    # TODO: Determine if your linter reports column numbers starting at 1 (True) or 0 (False).
-    column_at_1 = True
-
-    line_offset = 1 if line_at_1 else 0
-    col_offset = 1 if column_at_1 else 0
-    for line in lines:
-        if line.startswith("'") and line.endswith("'"):
-            line = line[1:-1]
-        match = DIAGNOSTIC_RE.match(line)
-        if match:
-            data = match.groupdict()
-            position = lsp.Position(
-                line=max([int(data["line"]) - line_offset, 0]),
-                character=int(data["column"]) - col_offset,
-            )
-            diagnostic = lsp.Diagnostic(
-                range=lsp.Range(
-                    start=position,
-                    end=position,
-                ),
-                message=data.get("message"),
-                severity=_get_severity(data["code"], data["type"]),
-                code=data["code"],
-                source=TOOL_MODULE,
-            )
-            diagnostics.append(diagnostic)
-
-    return diagnostics
+    _reset_caches(file)
+    _index_class_defs_by_line(file)
 
 
 # TODO: if you want to handle setting specific severity for your linter
@@ -210,80 +321,6 @@ def _get_severity(*_codes: list[str]) -> lsp.DiagnosticSeverity:
     # change it as appropriate for your linter.
     return lsp.DiagnosticSeverity.Error
 
-
-# **********************************************************
-# Linting features end here
-# **********************************************************
-
-# TODO: If your tool is a formatter then update this section.
-# Delete "Formatting features" section if your tool is NOT a
-# formatter.
-# **********************************************************
-# Formatting features start here
-# **********************************************************
-#  Sample implementations:
-#  Black: https://github.com/microsoft/vscode-black-formatter/blob/main/bundled/tool
-
-
-@LSP_SERVER.feature(lsp.TEXT_DOCUMENT_FORMATTING)
-def formatting(params: lsp.DocumentFormattingParams) -> list[lsp.TextEdit] | None:
-    """LSP handler for textDocument/formatting request."""
-    # If your tool is a formatter you can use this handler to provide
-    # formatting support on save. You have to return an array of lsp.TextEdit
-    # objects, to provide your formatted results.
-
-    document = LSP_SERVER.workspace.get_document(params.text_document.uri)
-    edits = _formatting_helper(document)
-    if edits:
-        return edits
-
-    # NOTE: If you provide [] array, VS Code will clear the file of all contents.
-    # To indicate no changes to file return None.
-    return None
-
-
-def _formatting_helper(document: workspace.Document) -> list[lsp.TextEdit] | None:
-    # TODO: For formatting on save support the formatter you use must support
-    # formatting via stdin.
-    # Read, and update_run_tool_on_document and _run_tool functions as needed
-    # for your formatter.
-    result = _run_tool_on_document(document, use_stdin=True)
-    if result.stdout:
-        new_source = _match_line_endings(document, result.stdout)
-        return [
-            lsp.TextEdit(
-                range=lsp.Range(
-                    start=lsp.Position(line=0, character=0),
-                    end=lsp.Position(line=len(document.lines), character=0),
-                ),
-                new_text=new_source,
-            )
-        ]
-    return None
-
-
-def _get_line_endings(lines: list[str]) -> str:
-    """Returns line endings used in the text."""
-    try:
-        if lines[0][-2:] == "\r\n":
-            return "\r\n"
-        return "\n"
-    except Exception:  # pylint: disable=broad-except
-        return None
-
-
-def _match_line_endings(document: workspace.Document, text: str) -> str:
-    """Ensures that the edited text line endings matches the document line endings."""
-    expected = _get_line_endings(document.source.splitlines(keepends=True))
-    actual = _get_line_endings(text.splitlines(keepends=True))
-    if actual == expected or actual is None or expected is None:
-        return text
-    return text.replace(actual, expected)
-
-
-# **********************************************************
-# Formatting features ends here
-# **********************************************************
 
 
 # **********************************************************
