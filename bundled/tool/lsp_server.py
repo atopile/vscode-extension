@@ -300,6 +300,7 @@ def did_open(params: lsp.DidOpenTextDocumentParams) -> None:
 #     #LSP_SERVER.publish_diagnostics(document.uri, [])
 #     log_to_output("did close")
 
+
 @LSP_SERVER.feature(lsp.TEXT_DOCUMENT_DID_SAVE)
 def did_save(params: lsp.DidSaveTextDocumentParams) -> None:
     """LSP handler for textDocument/didSave request."""

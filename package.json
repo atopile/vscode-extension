@@ -2,7 +2,7 @@
     "name": "atopile",
     "displayName": "atopile compiler",
     "description": "IDE support for atopile.",
-    "version": "2022.0.0-dev",
+    "version": "0.2.24-dev",
     "preview": true,
     "serverInfo": {
         "name": "atopile compiler",
