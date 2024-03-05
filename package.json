@@ -82,7 +82,7 @@
                     "type": "array"
                 },
                 "atopile.importStrategy": {
-                    "default": "fromEnvironment",
+                    "default": "useBundled",
                     "description": "Defines where `atopile` is imported from. This setting may be ignored if `atopile.path` is set.",
                     "enum": [
                         "useBundled",
@@ -160,6 +160,7 @@
     "devDependencies": {
         "@types/fs-extra": "^11.0.4",
         "@types/glob": "^8.1.0",
+        "@types/js-yaml": "^4.0.9",
         "@types/node": "16.x",
         "@types/vscode": "1.78.0",
         "@typescript-eslint/eslint-plugin": "^7.0.0",

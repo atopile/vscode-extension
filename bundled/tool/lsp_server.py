@@ -183,23 +183,25 @@ def completions(params: Optional[lsp.CompletionParams] = None) -> lsp.Completion
         for child in instance.children:
             items.append(lsp.CompletionItem(label=child, kind=lsp.CompletionItemKind.Method))
 
-    # ++ Class Defs
-    try:
-        class_ctx = front_end.scoop.get_obj_def(class_addr)
-    except (KeyError, errors.AtoError):
-        pass
-    else:
-        closure_contexts = [class_ctx]
-        if class_ctx.closure:
-            closure_contexts.extend(class_ctx.closure)
+    # Class Defs
+    # FIXME: this is a hack to check whether something could not be class-def
+    if "." not in word:
+        try:
+            class_ctx = front_end.scoop.get_obj_def(class_addr)
+        except (KeyError, errors.AtoError):
+            pass
+        else:
+            closure_contexts = [class_ctx]
+            if class_ctx.closure:
+                closure_contexts.extend(class_ctx.closure)
 
-        for closure_ctx in closure_contexts:
+            for closure_ctx in closure_contexts:
 
-            for cls_ref in closure_ctx.local_defs:
-                items.append(lsp.CompletionItem(label=cls_ref[0], kind=lsp.CompletionItemKind.Class))
+                for cls_ref in closure_ctx.local_defs:
+                    items.append(lsp.CompletionItem(label=cls_ref[0], kind=lsp.CompletionItemKind.Class))
 
-            for imp_ref in closure_ctx.imports:
-                items.append(lsp.CompletionItem(label=imp_ref[0], kind=lsp.CompletionItemKind.Class))
+                for imp_ref in closure_ctx.imports:
+                    items.append(lsp.CompletionItem(label=imp_ref[0], kind=lsp.CompletionItemKind.Class))
 
     return lsp.CompletionList(is_incomplete=False, items=items,)
 
@@ -230,6 +232,7 @@ def goto_definition(params: Optional[lsp.DefinitionParams] = None) -> Optional[l
 
     # See if it's an instance
     instance_addr = address.add_instances(class_addr, word.split("."))
+    src_ctx = None
     try:
         src_ctx = front_end.lofty.get_instance(instance_addr).src_ctx
     except (KeyError, errors.AtoError, AttributeError):
@@ -245,7 +248,7 @@ def goto_definition(params: Optional[lsp.DefinitionParams] = None) -> Optional[l
             )
         ).src_ctx
     except (KeyError, errors.AtoError, AttributeError):
-        return
+        pass
 
     try:
         file_path, start_line, start_col, stop_line, stop_col = atopile.parse_utils.get_src_info_from_ctx(src_ctx)
